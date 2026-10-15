@@ -73,33 +73,80 @@ def check_sequence(raw, vocab, max_len_trained):
 
 
 # ---------------------------------------------------------------- plot
-def build_figure(tab, n_labels=8, cutoff=0.0, dark=False):
-    """Interactive stick spectrum: b ions blue, y ions orange (colour-blind-safe pair, light/dark steps)."""
-    c_b, c_y = ('#3987e5', '#d95926') if dark else ('#2a78d6', '#eb6834')
+C_LIGHT = {'b': '#2a78d6', 'y': '#eb6834'}        # colour-blind-safe pair (light / dark theme steps)
+C_DARK = {'b': '#3987e5', 'y': '#d95926'}
+
+
+def _rgba(hex_colour, alpha):
+    h = hex_colour.lstrip('#')
+    return f'rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha:.2f})'
+
+
+def build_figure(tab, n_labels=12, cutoff=0.0, dark=False):
+    """Stick spectrum: b ions blue, y ions orange. Sticks have a fixed pixel width (independent of the m/z range),
+    every stick ends in a dot, and ions are labelled directly (all of them if there are few)."""
+    col = C_DARK if dark else C_LIGHT
     show = tab[tab['rel'] >= cutoff]
-    labelled = set(show.nlargest(n_labels, 'rel').index) if n_labels > 0 else set()
+    n_label = len(show) if len(show) <= 16 else n_labels            # few ions: label every one
+    labelled = set(show.nlargest(n_label, 'rel').index) if n_label > 0 else set()
     span = max(tab['mz'].max() - tab['mz'].min(), 1.0)
     fig = go.Figure()
-    for t, name, colour in (('b', 'b ions', c_b), ('y', 'y ions', c_y)):
+    for t, name in (('y', 'y ions'), ('b', 'b ions')):
         d = show[show['type'] == t]
-        fig.add_bar(
-            x=d['mz'], y=d['rel'], name=name, marker_color=colour, width=span * 0.004,
-            text=[ion if i in labelled else '' for i, ion in zip(d.index, d['ion'])],
-            textposition='outside', textangle=-90, cliponaxis=False, hoverinfo='skip')
-        # the sticks are only a few pixels wide, so hover is carried by invisible markers instead:
-        # with hovermode='x' the nearest stick (by x only) shows its tooltip anywhere in the column
+        if d.empty:
+            continue
+        xs, ys = [], []
+        for mz, rel in zip(d['mz'], d['rel']):
+            xs += [mz, mz, None]
+            ys += [0, rel, None]
+        fig.add_scatter(x=xs, y=ys, mode='lines', line=dict(color=col[t], width=4), name=name,
+                        hoverinfo='skip', legendgroup=t)
         fig.add_scatter(
-            x=d['mz'], y=d['rel'], mode='markers', marker=dict(size=16, color='rgba(0,0,0,0)'),
-            showlegend=False, customdata=d['ion'],
-            hovertemplate='%{customdata}<br>m/z %{x:.4f}<br>%{y:.1f}% of base peak<extra></extra>')
+            x=d['mz'], y=d['rel'], mode='markers+text', showlegend=False, legendgroup=t,
+            marker=dict(size=9, color=col[t]),
+            text=[ion if i in labelled else '' for i, ion in zip(d.index, d['ion'])],
+            textposition='top center', textfont=dict(size=13, color=col[t]), cliponaxis=False,
+            customdata=d['ion'],
+            hovertemplate='<b>%{customdata}</b><br>m/z %{x:.4f}<br>%{y:.1f}% of base peak<extra></extra>')
     fig.update_layout(
-        barmode='overlay', height=430, hovermode='x', hoverdistance=25,
+        height=440, hovermode='closest', hoverdistance=30,
         xaxis_title='m/z', yaxis_title='relative intensity (%)',
-        xaxis_range=[tab['mz'].min() - span * 0.04, tab['mz'].max() + span * 0.04],
-        yaxis_range=[0, 128],
+        xaxis_range=[tab['mz'].min() - span * 0.06, tab['mz'].max() + span * 0.06],
+        yaxis_range=[0, 118],
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         margin=dict(l=10, r=10, t=40, b=10))
-    fig.update_xaxes(showgrid=False)
+    fig.update_xaxes(showgrid=False, zeroline=False)
+    fig.update_yaxes(gridcolor='rgba(128,128,128,0.25)', zeroline=True, zerolinecolor='rgba(128,128,128,0.5)',
+                     tickvals=[0, 25, 50, 75, 100])
+    return fig
+
+
+def ladder_figure(seq, tab, dark=False):
+    """Fragment map: the sequence with, at every peptide bond, the b ion (above, N-terminal side) and the
+    complementary y ion (below). Strength of colour and line thickness follow the predicted intensity."""
+    col = C_DARK if dark else C_LIGHT
+    L = len(seq)
+    rel = {r['ion']: r['rel'] for _, r in tab.iterrows()}
+    fig = go.Figure()
+    fig.add_scatter(x=list(range(1, L + 1)), y=[0] * L, mode='text', text=list(seq), showlegend=False,
+                    textfont=dict(size=26), hoverinfo='skip')
+    for j in range(1, L):                                      # bond between residue j and j+1
+        for t, k, ysign in (('b', j, 1), ('y', L - j, -1)):
+            r = rel.get(f'{t}{k}')
+            if r is None:
+                continue
+            strength = 0.12 + 0.88 * r / 100
+            x = j + 0.5
+            # corner mark: vertical bar through the bond, with a short horizontal arm towards the fragment
+            arm = -0.28 if t == 'b' else 0.28
+            fig.add_scatter(x=[x + arm, x, x], y=[ysign * 0.95, ysign * 0.95, ysign * 0.45], mode='lines',
+                            line=dict(color=_rgba(col[t], strength), width=1.5 + 3.5 * r / 100),
+                            showlegend=False, hoverinfo='skip')
+            fig.add_scatter(x=[x], y=[ysign * 1.45], mode='text', text=[f'{t}{k}'], showlegend=False,
+                            textfont=dict(size=11, color=_rgba(col[t], max(strength, 0.45))),
+                            hovertemplate=f'{t}{k}: {r:.1f}% of base peak<extra></extra>')
+    fig.update_layout(height=170, margin=dict(l=10, r=10, t=5, b=5), hovermode='closest',
+                      xaxis=dict(visible=False, range=[0.3, L + 0.7]), yaxis=dict(visible=False, range=[-2.0, 2.0]))
     return fig
 
 
@@ -135,7 +182,7 @@ def main():
         charge = st.radio('Fragment charge (m/z axis only)', [1, 2], format_func=lambda z: f'{z}+',
                           horizontal=True, key='charge')
         cys = st.checkbox('Cysteine carbamidomethylated (+57.02146)', value=False, key='cys')
-        n_labels = st.slider('Labelled peaks', 0, 20, 8, key='labels')
+        n_labels = st.slider('Labelled peaks (peptides with more than 16 ions)', 0, 30, 12, key='labels')
         cutoff = st.slider('Hide peaks below (% of base peak)', 0.0, 20.0, 0.0, 0.5, key='cutoff')
 
     try:
@@ -177,11 +224,14 @@ def main():
     tab = ion_table(seq, intensities, meta['n_frag'], charge, res)
     mass = neutral_mass(seq, res)
 
-    c1, c2, c3, c4 = st.columns(4)
+    b_share = tab.loc[tab['type'] == 'b', 'intensity'].sum() / max(tab['intensity'].sum(), 1e-12)
+    top = tab.loc[tab['intensity'].idxmax(), 'ion'] if tab['intensity'].max() > 0 else '-'
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric('Length', f'{len(seq)} residues')
-    c2.metric('Monoisotopic mass [M]', f'{mass:.4f} Da')
+    c2.metric('Mass [M] (Da)', f'{mass:.4f}')
     c3.metric('[M+2H]2+ m/z', f'{(mass + 2 * PROTON) / 2:.4f}')
-    c4.metric('[M+3H]3+ m/z', f'{(mass + 3 * PROTON) / 3:.4f}')
+    c4.metric('Strongest ion', top)
+    c5.metric('Predicted b / y share', f'{100 * b_share:.0f}% / {100 * (1 - b_share):.0f}%')
 
     if not tab['intensity'].max() > 0:
         st.warning('The model predicts no fragment signal for this peptide.')
@@ -191,13 +241,19 @@ def main():
         dark = st.context.theme.type == 'dark'
     except Exception:
         dark = False
+    st.subheader('Predicted spectrum')
     show_plot(build_figure(tab, n_labels, cutoff, dark))
+    st.subheader('Fragment map')
+    st.caption('Every peptide bond with its b ion (above, blue) and complementary y ion (below, orange). '
+               'Darker and thicker = stronger predicted ion.')
+    show_plot(ladder_figure(seq, tab, dark))
 
     out = tab.rename(columns={'mz': 'm/z', 'rel': 'relative intensity (%)', 'intensity': 'predicted intensity'})
     out['m/z'] = out['m/z'].round(4)
     out['relative intensity (%)'] = out['relative intensity (%)'].round(2)
     out = out[['ion', 'type', 'm/z', 'relative intensity (%)', 'predicted intensity']]
-    st.dataframe(out, hide_index=True)
+    with st.expander('Ion table', expanded=False):
+        st.dataframe(out, hide_index=True)
     st.download_button('Download table (CSV)', out.to_csv(index=False).encode('utf-8'),
                        file_name=f'{seq}_predicted_spectrum.csv', mime='text/csv')
     if zs:

@@ -179,8 +179,6 @@ def main():
     with st.sidebar:
         st.header('Settings')
         ckpt_path = st.text_input('Model file', os.path.join(here, 'peptide_predictor.pt'), key='ckpt')
-        charge = st.radio('Fragment charge (m/z axis only)', [1, 2], format_func=lambda z: f'{z}+',
-                          horizontal=True, key='charge')
         cys = st.checkbox('Cysteine carbamidomethylated (+57.02146)', value=False, key='cys')
         n_labels = st.slider('Labelled peaks (peptides with more than 16 ions)', 0, 30, 12, key='labels')
         cutoff = st.slider('Hide peaks below (% of base peak)', 0.0, 20.0, 0.0, 0.5, key='cutoff')
@@ -206,6 +204,18 @@ def main():
                           format_func=lambda z: f'{z}+', horizontal=True, key='pz')
     else:
         pz = None
+    with st.sidebar:                                               # a 1+ precursor can only give 1+ fragments
+        charge = st.radio('Fragment charge (m/z axis only)', [1] if pz == 1 else [1, 2], format_func=lambda z: f'{z}+',
+                          horizontal=True, key='charge')
+    es = meta.get('energies') or []
+    if es:
+        default = 28.0 if min(es) <= 28 <= max(es) else float(es[len(es) // 2])
+        with st.sidebar:
+            pe = st.slider('Collision energy (HCD, NCE)', float(min(es)), float(max(es)), default, 1.0, format='%g', key='pe')
+            st.caption('Trained at NCE ' + ', '.join(f'{e:g}' for e in es) + '. Values in between are interpolated. '
+                       'NCE depends on the instrument: pick the value that matches your method.')
+    else:
+        pe = None
 
     raw = st.text_input('Peptide sequence (one-letter codes)', value='TIFPSQNGHDGSTDVQQR', key='seq')
     vocab = set(meta['aa']) & set(RESIDUE)
@@ -218,9 +228,11 @@ def main():
         st.stop()
     if warn:
         st.warning(warn)
+    if len(seq) > meta['n_frag'] + 1:
+        st.warning(f"Only y1-y{meta['n_frag']} and b1-b{meta['n_frag']} are predicted; this peptide has more fragment positions.")
 
     res = residue_masses(cys)
-    intensities = predict_intensities(model, meta, seq, pz)
+    intensities = predict_intensities(model, meta, seq, pz, pe)
     tab = ion_table(seq, intensities, meta['n_frag'], charge, res)
     mass = neutral_mass(seq, res)
 
@@ -229,7 +241,8 @@ def main():
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric('Length', f'{len(seq)} residues')
     c2.metric('Mass [M] (Da)', f'{mass:.4f}')
-    c3.metric('[M+2H]2+ m/z', f'{(mass + 2 * PROTON) / 2:.4f}')
+    zp = int(pz) if pz else 2
+    c3.metric(f'[M+{zp}H]{zp}+ m/z', f'{(mass + zp * PROTON) / zp:.4f}')
     c4.metric('Strongest ion', top)
     c5.metric('Predicted b / y share', f'{100 * b_share:.0f}% / {100 * (1 - b_share):.0f}%')
 
@@ -257,8 +270,9 @@ def main():
     st.download_button('Download table (CSV)', out.to_csv(index=False).encode('utf-8'),
                        file_name=f'{seq}_predicted_spectrum.csv', mime='text/csv')
     if zs:
-        st.caption(f'Prediction for a {pz}+ precursor. The precursor charge is a model input (trained on {", ".join(f"{z}+" for z in zs)}); '
-                   'collision energy is not. The fragment-charge and cysteine settings change the m/z values only.')
+        st.caption(f'Prediction for a {pz}+ precursor' + (f' at NCE {pe:g}' if es else '') + '. '
+                   f'Precursor charge (trained on {", ".join(f"{z}+" for z in zs)})' + (' and collision energy are model inputs' if es else ' is a model input; collision energy is not')
+                   + '. The fragment-charge and cysteine settings change the m/z values only.')
     else:
         st.caption('This model sees only the sequence: precursor charge and collision energy are not inputs. '
                    'The charge and cysteine settings change the m/z values only, not the predicted intensities.')

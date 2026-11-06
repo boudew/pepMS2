@@ -3,6 +3,9 @@
 Start:  streamlit run peptide_app.py
 Needs:  pip install streamlit plotly pandas numpy torch
 Same folder: peptide_model.py and peptide_predictor.pt (written by the notebook's export cell).
+Retention time (optional): rt_model.py, calibrate_rt.py and rt_DIA.pt in the same folder. Without them the
+spectrum part works as before; with them the app shows a relative RT, or the RT in your own units once an
+RT calibration (calibrated .pt or a peptide/RT table) is uploaded in the sidebar.
 """
 import inspect
 import os
@@ -165,6 +168,180 @@ def get_model(path):
     return load_checkpoint(path)
 
 
+# ---------------------------------------------------------------- retention time
+RT_TABLE_TYPES = ('csv', 'tsv', 'txt', 'xlsx')
+
+
+@st.cache_resource(show_spinner='Loading RT model...')
+def get_rt_base(path, mtime):
+    from rt_model import RTPredictor
+    return RTPredictor(path)
+
+
+@st.cache_resource(show_spinner='Loading RT calibration...')
+def get_rt_from_pt(data):
+    from rt_model import RTPredictor
+    return RTPredictor(data)
+
+
+@st.cache_data(show_spinner='Reading table...')
+def read_rt_table(data, file_name):
+    from calibrate_rt import read_table
+    return read_table(data, file_name)
+
+
+@st.cache_resource(show_spinner='Calibrating RT model on your peptides...')
+def get_rt_from_table(data, file_name, base_path, unit, method_name, pep_col, rt_col):
+    from rt_model import RTPredictor
+    from calibrate_rt import calibrate_table
+    model = RTPredictor(base_path)
+    table, msgs = calibrate_table(read_rt_table(data, file_name), model, pep_col=pep_col, rt_col=rt_col,
+                                  unit=unit, name=method_name)
+    model.calibration_info['source_table'] = file_name
+    return model, table, msgs
+
+
+def rt_sidebar(here):
+    """Sidebar block for retention time. Returns (rt_model or None, calibration table or None, notes)."""
+    base_path = os.path.join(here, 'rt_DIA.pt')
+    st.header('Retention time')
+    if not os.path.exists(base_path):
+        st.caption('RT prediction is off: put rt_DIA.pt and rt_model.py next to this app to switch it on.')
+        return None, None, []
+    try:
+        base = get_rt_base(base_path, os.path.getmtime(base_path))
+    except Exception as e:
+        st.warning(f'Could not load the RT model ({e}). RT prediction is off.')
+        return None, None, []
+
+    up = st.file_uploader(
+        'RT calibration (optional)', type=('pt',) + RT_TABLE_TYPES, key='rt_upload',
+        help='Either a calibrated RT model (.pt made by calibrate_rt.py or downloaded from this app), or a table '
+             'of identified peptides with their measured RT from one LC method (CSV/TSV/Excel, columns such as '
+             'Peptide and RT). Without a calibration the app shows the relative RT (0-1).')
+    if up is None:
+        st.caption('No calibration: showing relative RT on a 0-1 scale (early to late elution).')
+        return base, None, []
+
+    data = up.getvalue()
+    ext = os.path.splitext(up.name)[1].lower().lstrip('.')
+    if ext == 'pt':
+        try:
+            model = get_rt_from_pt(data)
+        except Exception as e:
+            st.error(f'Could not use {up.name}: {e}')
+            return base, None, []
+        if not model.is_calibrated:
+            st.info(f'{up.name} is an RT model without calibration: showing relative RT from this model.')
+        return model, None, []
+
+    try:
+        from calibrate_rt import guess_columns, calibrate_table  # noqa: F401  (checks the file is up to date)
+    except ImportError as e:
+        st.error('calibrate_rt.py next to this app is missing or an older version '
+                 f'({e}). Replace it with the latest calibrate_rt.py and restart the app. '
+                 'Uploading a calibrated .pt still works.')
+        return base, None, []
+    try:
+        df = read_rt_table(data, up.name)
+    except Exception as e:
+        st.error(f'Could not read {up.name}: {e}')
+        return base, None, []
+    cols = [str(c) for c in df.columns]
+    g_pep, g_rt = guess_columns(df)
+    pep_col = st.selectbox('Peptide column', cols, index=cols.index(str(g_pep)) if g_pep is not None else 0,
+                           key=f'rt_pep_col_{up.name}_{len(data)}')
+    rt_col = st.selectbox('RT column', cols, index=cols.index(str(g_rt)) if g_rt is not None else min(1, len(cols) - 1),
+                          key=f'rt_rt_col_{up.name}_{len(data)}')
+    unit = st.selectbox('RT unit in your table', ['min', 's', 'iRT'], key='rt_unit')
+    method = st.text_input('LC method name', os.path.splitext(up.name)[0], key='rt_method')
+    if g_pep is None or g_rt is None:
+        st.caption('Could not recognise the column names: check the peptide and RT columns above.')
+    try:
+        model, table, msgs = get_rt_from_table(data, up.name, base_path, unit, method,
+                                               df.columns[cols.index(pep_col)], df.columns[cols.index(rt_col)])
+    except Exception as e:  # CalibrationError or unreadable file
+        st.error(f'Calibration failed: {e}')
+        return base, None, []
+    st.download_button('Download calibrated RT model (.pt)', model.to_bytes(),
+                       file_name=f"rt_DIA_{''.join(c if c.isalnum() else '_' for c in method)}.pt",
+                       help='Upload this file next time instead of the table; it holds the same calibration.')
+    return model, table, msgs
+
+
+def rt_unit(info):
+    return info.get('unit') or 'RT units'
+
+
+def rt_metric(rt_model, seq):
+    """Returns (label, value, help, notes) for the RT metric of one peptide."""
+    from rt_model import check_peptide
+    calibrated = rt_model.is_calibrated
+    label = 'Predicted RT' if calibrated else 'Relative RT'
+    problem = check_peptide(seq)
+    if problem:
+        return label, 'n/a', f'No RT prediction: the RT model only handles unmodified peptides of up to 19 residues ({problem}).', []
+    raw = float(rt_model.predict_raw([seq])[0])
+    if not calibrated:
+        return (label, f'{raw:.3f}',
+                'Relative retention on a 0-1 scale (early to late, scale of the DIA training data). '
+                'Upload an RT calibration in the sidebar to get the RT of your LC method.', [])
+    info = rt_model.calibration_info
+    u = rt_unit(info)
+    rt = float(rt_model.predict([seq])[0])
+    helptext = f"Calibrated on {info.get('n_used', '?')} peptides ({info.get('name') or 'uploaded calibration'})."
+    if 'cv_abs_error_95pct' in info:
+        helptext += (f" Typical error {info['cv_median_abs_error']:.2f} {u}; 95% of peptides within "
+                     f"±{info['cv_abs_error_95pct']:.2f} {u} (cross-validated).")
+    notes = []
+    lo, hi = info.get('model_output_range', (raw, raw))
+    if raw < lo or raw > hi:
+        r0, r1 = info.get('rt_range', (float('nan'), float('nan')))
+        notes.append(f'This peptide elutes outside the RT range of the calibration peptides ({r0:.1f}-{r1:.1f} {u}); '
+                     f'the predicted RT is an extrapolation, treat it as rough.')
+    return label, f'{rt:.2f} {u}' if u != 'RT units' else f'{rt:.2f}', helptext, notes
+
+
+def rt_calibration_details(rt_model, table, msgs, dark=False):
+    info = rt_model.calibration_info
+    u = rt_unit(info)
+    with st.expander(f"RT calibration: {info.get('name') or 'uploaded'}", expanded=False):
+        line = (f"{info.get('n_peptides', '?')} peptides, {info.get('n_used', '?')} used "
+                f"(outliers removed), RT range {info['rt_range'][0]:.1f}-{info['rt_range'][1]:.1f} {u}, "
+                f"r = {info.get('pearson_r', float('nan')):.3f}")
+        if 'cv_median_abs_error' in info:
+            line += (f"; typical error {info['cv_median_abs_error']:.2f} {u}, 95% within "
+                     f"±{info['cv_abs_error_95pct']:.2f} {u} (cross-validated)")
+        st.write(line + '.')
+        for m in msgs:
+            st.caption(m)
+        if table is None:
+            return
+        col = C_DARK if dark else C_LIGHT
+        used = table[table['used_in_fit']]
+        out = table[~table['used_in_fit']]
+        pred = 'cv_residual' in table
+        y_pred = lambda d: d['measured_rt'] + (d['cv_residual'] if pred else d['residual'])
+        fig = go.Figure()
+        fig.add_scatter(x=used['measured_rt'], y=y_pred(used), mode='markers', name='used',
+                        marker=dict(size=5, color=col['b'], opacity=0.5), text=used['peptide'],
+                        hovertemplate='%{text}<br>measured %{x:.2f}<br>predicted %{y:.2f}<extra></extra>')
+        if len(out):
+            fig.add_scatter(x=out['measured_rt'], y=y_pred(out), mode='markers', name='outlier (removed)',
+                            marker=dict(size=7, color=col['y'], symbol='x'), text=out['peptide'],
+                            hovertemplate='%{text}<br>measured %{x:.2f}<br>predicted %{y:.2f}<extra></extra>')
+        lo, hi = float(table['measured_rt'].min()), float(table['measured_rt'].max())
+        fig.add_scatter(x=[lo, hi], y=[lo, hi], mode='lines', name='1:1',
+                        line=dict(color='rgba(128,128,128,0.7)', width=1, dash='dash'), hoverinfo='skip')
+        fig.update_layout(height=380, xaxis_title=f'measured RT ({u})',
+                          yaxis_title=f"predicted RT ({u})" + (' — cross-validated' if pred else ''),
+                          legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                          margin=dict(l=10, r=10, t=40, b=10))
+        show_plot(fig)
+        st.download_button('Download calibration table (CSV)', table.to_csv(index=False).encode('utf-8'),
+                           file_name='rt_calibration_peptides.csv', mime='text/csv')
+
+
 # ---------------------------------------------------------------- app
 def main():
     st.set_page_config(page_title='Peptide MS/MS predictor', layout='wide')
@@ -216,6 +393,8 @@ def main():
                        'NCE depends on the instrument: pick the value that matches your method.')
     else:
         pe = None
+    with st.sidebar:
+        rt_model, rt_table, rt_msgs = rt_sidebar(here)
 
     raw = st.text_input('Peptide sequence (one-letter codes)', value='TIFPSQNGHDGSTDVQQR', key='seq')
     vocab = set(meta['aa']) & set(RESIDUE)
@@ -245,6 +424,20 @@ def main():
     c3.metric(f'[M+{zp}H]{zp}+ m/z', f'{(mass + zp * PROTON) / zp:.4f}')
     c4.metric('Strongest ion', top)
     c5.metric('Predicted b / y share', f'{100 * b_share:.0f}% / {100 * (1 - b_share):.0f}%')
+    if rt_model is not None:
+        try:
+            rt_label, rt_value, rt_help, rt_notes = rt_metric(rt_model, seq)
+        except Exception as e:  # never let RT break the spectrum prediction
+            rt_label, rt_value, rt_help, rt_notes = 'RT', 'error', f'RT prediction failed: {e}', []
+        try:   # vertical_alignment needs Streamlit >= 1.36
+            r1, r2 = st.columns([1, 4], vertical_alignment='bottom')
+        except TypeError:
+            r1, r2 = st.columns([1, 4])
+        r1.metric(rt_label, rt_value)
+        with r2:
+            st.caption(rt_help)
+            for note in rt_notes:
+                st.caption(f'⚠ {note}')
 
     if not tab['intensity'].max() > 0:
         st.warning('The model predicts no fragment signal for this peptide.')
@@ -276,6 +469,8 @@ def main():
     else:
         st.caption('This model sees only the sequence: precursor charge and collision energy are not inputs. '
                    'The charge and cysteine settings change the m/z values only, not the predicted intensities.')
+    if rt_model is not None and rt_model.is_calibrated:
+        rt_calibration_details(rt_model, rt_table, rt_msgs, dark)
 
 
 if __name__ == '__main__':
